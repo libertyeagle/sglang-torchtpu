@@ -147,7 +147,7 @@ HICACHE_IO_BACKEND_CHOICES = [
     "raiden",
 ]
 
-PD_DECODE_DCP_TRANSFER_BACKENDS = ["mooncake", "nixl", "ascend", "fake"]
+DISAGG_DCP_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -276,7 +276,7 @@ add_radix_supported_deterministic_attention_backend_choices = (
 # --- Transport ---
 
 add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
-add_pd_decode_dcp_transfer_backends = PD_DECODE_DCP_TRANSFER_BACKENDS.extend
+add_disagg_dcp_transfer_backend_choices = DISAGG_DCP_TRANSFER_BACKEND_CHOICES.extend
 
 # --- Sampling and grammar ---
 

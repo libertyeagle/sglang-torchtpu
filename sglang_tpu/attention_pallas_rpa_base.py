@@ -52,6 +52,7 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
     broadcast_own_kv_heads,
     build_dcp_kernel_op,
     build_owner_write_spans,
+    build_verify_step_on_device,
     fused_kv_rows,
     gather_heads,
     merge_across_ranks,
@@ -753,6 +754,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         bs = self._pre_bucket_padded_batch_size(forward_batch)
         if bs == 0:
             return bs
+        if getattr(forward_batch, "non_empty_batch_size", None) is not None:
+            return forward_batch.non_empty_batch_size
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         seq_lens = seq_lens_cpu if seq_lens_cpu is not None else forward_batch.seq_lens
         live = int(torch.count_nonzero(seq_lens[:bs]).item())
@@ -1067,11 +1070,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         if self._dcp > 1 and forward_batch.forward_mode not in (
             ForwardMode.DECODE,
             ForwardMode.EXTEND,
+            ForwardMode.TARGET_VERIFY,
         ):
             raise ValueError(
-                "Decode context parallelism supports plain decode and extend "
+                "Decode context parallelism supports decode, extend and target-verify "
                 f"batches only; got {forward_batch.forward_mode.name}. "
-                "Speculative decoding, mixed batches and split prefill are not "
+                "Mixed batches and split prefill are not "
                 "supported on the TPU DCP path."
             )
 
@@ -1126,7 +1130,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         dcp_cp_rank: torch.Tensor | None = None
         seq_lens_host: torch.Tensor | None = None
         ext_host: torch.Tensor | None = None
-        if self._dcp > 1:
+        dcp_verify_on_device = (
+            self._dcp > 1
+            and forward_batch.forward_mode.is_target_verify()
+            and seq_lens_cpu is None
+        )
+        if self._dcp > 1 and not dcp_verify_on_device:
             # The kernel derives the global query position of a local key from
             # the unsharded lengths, so it needs them alongside the shard. The
             # prefix shard excludes this step's own tokens: the extend path
@@ -1136,6 +1145,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 list(seq_lens_cpu) if isinstance(seq_lens_cpu, list) else seq_lens_cpu,
                 dtype=torch.int64,
             )[:bs]
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens_host = seq_lens_host + query_width
             live = seq_lens_host.numel()
             ext_host = (
                 torch.tensor(query_lens[:live], dtype=torch.int64)
@@ -1191,7 +1202,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         step_slots: torch.Tensor | None = None
         step_positions: torch.Tensor | None = None
         num_tokens = 0
-        if self._dcp > 1:
+        if self._dcp > 1 and not dcp_verify_on_device:
             # The slots and positions of this step's tokens come from the host
             # request-to-token table, so the owner-masked write targets are
             # built here and shipped with the rest of the metadata, padded to
@@ -1237,7 +1248,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 ),
                 device=device,
             )
-            if self._dcp > 1:
+            if self._dcp > 1 and not dcp_verify_on_device:
                 # SWA layers write into the SWA sub-pool, whose slots the
                 # mapping gives for the same tokens.
                 swa_slots = full_to_swa[step_slots.to(full_to_swa.device)].to(
@@ -1254,13 +1265,35 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 ).to_device(device)
 
         # Page tables change with KV growth, so they are value-checked.
+        page_indices = self._value_metadata(
+            name="page_indices", value=page_indices, device=device
+        )
+        if dcp_verify_on_device:
+            (
+                kv_lens,
+                dcp_kv_lens_global,
+                dcp_prefix_kv_lens,
+                index,
+                full,
+                swa,
+            ) = build_verify_step_on_device(
+                forward_batch.seq_lens[:bs],
+                page_indices,
+                swa_page_indices,
+                query_width,
+                self._dcp,
+                self._dcp_rank,
+                page_size,
+                forward_batch.out_cache_loc.shape[0],
+            )
+            write_spans = DcpWriteSpans(index, *full)
+            swa_write_spans = DcpWriteSpans(index, *swa) if swa is not None else None
+            dcp_cp_rank = self._cp_rank_t
         return PallasForwardMetadata(
             kv_lens=kv_lens,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
-            page_indices=self._value_metadata(
-                name="page_indices", value=page_indices, device=device
-            ),
+            page_indices=page_indices,
             distribution=distribution,
             active_num_tokens=active_num_tokens,
             swa_page_indices=swa_page_indices,
